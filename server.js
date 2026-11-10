@@ -1,4 +1,4 @@
-```javascript
+
 const express = require('express');
 const { ExpressPeerServer } = require('peer');
 
@@ -19,4 +19,4 @@ const peerServer = ExpressPeerServer(server, {
 });
 
 app.use('/peerjs', peerServer);
-```
+
