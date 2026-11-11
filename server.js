@@ -1,6 +1,6 @@
 const express = require('express');
 const http = require('http');
-const { ExpressPeerServer } = require('peer');
+const { Server } = require('socket.io');
 
 const app = express();
 const port = process.env.PORT || 10000;
@@ -14,60 +14,113 @@ app.use((req, res, next) => {
 });
 app.use(express.json());
 
-const lobbies = new Map();
-const connectedPeers = new Set();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: '*', methods: ['GET', 'POST'] },
+  pingInterval: 25000,
+  pingTimeout: 20000
+});
 
-app.get('/', (req, res) => res.send({ status: 'live', online: connectedPeers.size, lobbies: lobbies.size }));
-app.get('/ping', (req, res) => res.send('ok')); // Used by client to detect when server wakes up
+const lobbies = new Map();
+
+// Endpoints
+app.get('/', (req, res) => res.send({ status: 'live', online: io.engine.clientsCount, lobbies: lobbies.size }));
+app.get('/ping', (req, res) => res.send('ok')); // UptimeRobot pings this
 
 app.get('/api/lobbies', (req, res) => {
-  const now = Date.now();
   const list = [];
   for (const [code, l] of lobbies.entries()) {
-    if (now - l.ts > 15000) lobbies.delete(code);
-    else list.push(l);
+    if (!l.priv) list.push({ c: l.code, h: l.hostName, n: l.num, ph: l.phase });
   }
-  res.json({ online: Math.max(1, connectedPeers.size), lobbies: list });
+  res.json({ online: Math.max(1, io.engine.clientsCount), lobbies: list });
 });
 
-app.post('/api/register-lobby', (req, res) => {
-  const { code, host, num, phase, priv } = req.body || {};
-  if (!code || typeof code !== 'string') return res.status(400).json({ error: 'Missing code' });
-  const c = code.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
-  if (priv) lobbies.delete(c);
-  else lobbies.set(c, {
-    c,
-    h: String(host || 'Host').replace(/[^\w .\-]/g, '').slice(0, 14) || 'Host',
-    n: Math.min(20, Math.max(1, +num || 1)),
-    ph: ['lobby', 'play', 'end'].includes(phase) ? phase : 'lobby',
-    ts: Date.now()
+io.on('connection', (socket) => {
+  let currentRoom = null;
+
+  socket.on('host-lobby', ({ code, name, priv }) => {
+    currentRoom = code.toUpperCase();
+    socket.join(currentRoom);
+    lobbies.set(currentRoom, {
+      code: currentRoom,
+      hostId: socket.id,
+      hostName: name || 'Host',
+      num: 1,
+      phase: 'lobby',
+      priv: !!priv
+    });
+    socket.emit('hosted', { id: socket.id });
   });
-  res.json({ ok: true });
+
+  socket.on('join-lobby', ({ code, name, skin }) => {
+    const roomCode = code.toUpperCase();
+    const lobby = lobbies.get(roomCode);
+    if (!lobby) {
+      return socket.emit('join-error', 'Lobby not found. Check the code.');
+    }
+    if (lobby.num >= 20) {
+      return socket.emit('join-error', 'Lobby is full.');
+    }
+
+    currentRoom = roomCode;
+    socket.join(currentRoom);
+    lobby.num = io.sockets.adapter.rooms.get(currentRoom)?.size || (lobby.num + 1);
+
+    socket.emit('joined', { id: socket.id, hostId: lobby.hostId });
+
+    // Send handshake to the host
+    io.to(lobby.hostId).emit('from-client', {
+      from: socket.id,
+      msg: { t: 'hi', name, skin }
+    });
+  });
+
+  socket.on('to-host', (msg) => {
+    if (!currentRoom) return;
+    const lobby = lobbies.get(currentRoom);
+    if (lobby && lobby.hostId) {
+      io.to(lobby.hostId).emit('from-client', { from: socket.id, msg });
+    }
+  });
+
+  socket.on('broadcast', (msg) => {
+    if (!currentRoom) return;
+    socket.to(currentRoom).emit('from-host', msg);
+  });
+
+  socket.on('to-client', ({ to, msg }) => {
+    io.to(to).emit('from-host', msg);
+  });
+
+  socket.on('update-lobby', (data) => {
+    if (!currentRoom) return;
+    const lobby = lobbies.get(currentRoom);
+    if (lobby && lobby.hostId === socket.id) {
+      if (data.phase) lobby.phase = data.phase;
+      if (data.num !== undefined) lobby.num = data.num;
+      if (data.priv !== undefined) lobby.priv = data.priv;
+    }
+  });
+
+  socket.on('disconnect', () => {
+    if (!currentRoom) return;
+    const lobby = lobbies.get(currentRoom);
+    if (lobby) {
+      const room = io.sockets.adapter.rooms.get(currentRoom);
+      if (!room || room.size === 0) {
+        lobbies.delete(currentRoom);
+      } else {
+        lobby.num = room.size;
+        if (lobby.hostId === socket.id) {
+          const [nextHostId] = room;
+          lobby.hostId = nextHostId;
+          io.to(nextHostId).emit('promoted-to-host');
+          io.to(currentRoom).emit('from-host', { t: 'host-migrated', newHost: nextHostId });
+        }
+        io.to(lobby.hostId).emit('client-disconnected', { id: socket.id });
+      }
+    }
+  });
 });
 
-const server = http.createServer(app);
-
-// Keep-alive settings to prevent Render proxy from dropping idle connections
-const peerServer = ExpressPeerServer(server, { 
-  debug: false, 
-  proxied: true, 
-  allow_discovery: false,
-  alive_timeout: 60000,
-  key: 'peerjs'
-});
-
-app.use('/peerjs', peerServer);
-
-peerServer.on('connection', (client) => {
-  connectedPeers.add(client.getId());
-});
-
-peerServer.on('disconnect', (client) => {
-  const id = client.getId();
-  connectedPeers.delete(id);
-  for (const code of [...lobbies.keys()]) {
-    if (id === 'arenarecoil-' + code) lobbies.delete(code);
-  }
-});
-
-server.listen(port, () => console.log('Arena Recoil signaling server running on port ' + port));
+server.listen(port, () => console.log('Arena Recoil Socket.io server running on port ' + port));
