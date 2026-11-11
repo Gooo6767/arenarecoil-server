@@ -18,7 +18,7 @@ const lobbies = new Map();
 const connectedPeers = new Set();
 
 app.get('/', (req, res) => res.send({ status: 'live', online: connectedPeers.size, lobbies: lobbies.size }));
-app.get('/ping', (req, res) => res.send('ok')); // point UptimeRobot here so Render never sleeps
+app.get('/ping', (req, res) => res.send('ok')); // Used by client to detect when server wakes up
 
 app.get('/api/lobbies', (req, res) => {
   const now = Date.now();
@@ -46,15 +46,28 @@ app.post('/api/register-lobby', (req, res) => {
 });
 
 const server = http.createServer(app);
-const peerServer = ExpressPeerServer(server, { debug: false, proxied: true, allow_discovery: false });
+
+// Keep-alive settings to prevent Render proxy from dropping idle connections
+const peerServer = ExpressPeerServer(server, { 
+  debug: false, 
+  proxied: true, 
+  allow_discovery: false,
+  alive_timeout: 60000,
+  key: 'peerjs'
+});
+
 app.use('/peerjs', peerServer);
 
-peerServer.on('connection', (client) => connectedPeers.add(client.getId()));
+peerServer.on('connection', (client) => {
+  connectedPeers.add(client.getId());
+});
+
 peerServer.on('disconnect', (client) => {
   const id = client.getId();
   connectedPeers.delete(id);
-  for (const code of [...lobbies.keys()]) if (id === 'arenarecoil-' + code) lobbies.delete(code);
+  for (const code of [...lobbies.keys()]) {
+    if (id === 'arenarecoil-' + code) lobbies.delete(code);
+  }
 });
 
-server.listen(port, () => console.log('Arena Recoil signaling server on port ' + port));
-
+server.listen(port, () => console.log('Arena Recoil signaling server running on port ' + port));
